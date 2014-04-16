@@ -1,4 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
+// Copyright (c) 2011 The Bitcoin developers
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
 
@@ -15,9 +16,20 @@
 #ifdef _WIN32_IE
 #undef _WIN32_IE
 #endif
+
 #define _WIN32_IE 0x0400
 #define WIN32_LEAN_AND_MEAN 1
-#define __STDC_LIMIT_MACROS // to enable UINT64_MAX from stdint.h
+
+#ifndef __STDC_LIMIT_MACROS
+#define __STDC_LIMIT_MACROS
+// to enable UINT64_MAX from stdint.h
+#include <stdint.h>
+#endif
+
+// Include boost/foreach here as it defines __STDC_LIMIT_MACROS on some systems.
+// #include <boost/foreach.hpp>
+
+
 #if (defined(__unix__) || defined(unix)) && !defined(USG)
 #include <sys/param.h>  // to get BSD define
 #endif
@@ -56,8 +68,6 @@
 #include <deque>
 #include <map>
 
-#include <boost/foreach.hpp>
-
 #ifdef __WXMSW__
 #include <windows.h>
 #include <winsock2.h>
@@ -68,21 +78,13 @@
 #include <process.h>
 #include <malloc.h>
 #else
+#include <unistd.h>
 #include <sys/time.h>
 #include <sys/resource.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <unistd.h>
 #include <errno.h>
-#include <net/if.h>
-#include <ifaddrs.h>
 #include <fcntl.h>
 #include <signal.h>
-#endif
-#ifdef BSD
-#include <netinet/in.h>
 #endif
 
 
@@ -99,19 +101,4 @@
 #include "ui.h"
 #else
 #include "noui.h"
-#endif
-
-#ifdef GUI
-#include "xpm/addressbook16.xpm"
-#include "xpm/addressbook20.xpm"
-#include "xpm/bitcoin16.xpm"
-#include "xpm/bitcoin20.xpm"
-#include "xpm/bitcoin32.xpm"
-#include "xpm/bitcoin48.xpm"
-#include "xpm/bitcoin80.xpm"
-#include "xpm/check.xpm"
-#include "xpm/send16.xpm"
-#include "xpm/send16noshadow.xpm"
-#include "xpm/send20.xpm"
-#include "xpm/about.xpm"
 #endif

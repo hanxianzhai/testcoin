@@ -1,4 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
+// Copyright (c) 2011 The Bitcoin developers
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
 
@@ -238,7 +239,6 @@ bool GetIPFromIRC(SOCKET hSocket, string strMyName, unsigned int& ipRet)
 
 void ThreadIRCSeed(void* parg)
 {
-    IMPLEMENT_RANDOMIZE_STACK(ThreadIRCSeed(parg));
     try
     {
         ThreadIRCSeed2(parg);
@@ -344,13 +344,15 @@ void ThreadIRCSeed2(void* parg)
         }
         
         if (fTestNet) {
-            Send(hSocket, "JOIN #bitcoinTEST\r");
-            Send(hSocket, "WHO #bitcoinTEST\r");
+            Send(hSocket, "JOIN #devcoinTEST\r");
+            Send(hSocket, "WHO #devcoinTEST\r");
         } else {
-            // randomly join #bitcoin00-#bitcoin99
-            int channel_number = GetRandInt(100);
-            Send(hSocket, strprintf("JOIN #bitcoin%02d\r", channel_number).c_str());
-            Send(hSocket, strprintf("WHO #bitcoin%02d\r", channel_number).c_str());
+            // randomly join #devcoin00-#devcoin99
+//            int channel_number = GetRandInt(100);
+//            Send(hSocket, strprintf("JOIN #devcoin%02d\r", channel_number).c_str());
+//            Send(hSocket, strprintf("WHO #devcoin%02d\r", channel_number).c_str());
+            Send(hSocket, "JOIN #devcoin\r");
+            Send(hSocket, "WHO #devcoin\r");
         }
 
         int64 nStart = GetTime();

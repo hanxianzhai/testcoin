@@ -1,10 +1,12 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
+// Copyright (c) 2011 The Bitcoin developers
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
 
 #include "headers.h"
 #include "db.h"
 #include "net.h"
+#include "auxpow.h"
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
 
@@ -27,6 +29,23 @@ DbEnv dbenv(0);
 static map<string, int> mapFileUseCount;
 static map<string, Db*> mapDb;
 
+static void EnvShutdown()
+{
+    if (!fDbEnvInit)
+        return;
+
+    fDbEnvInit = false;
+    try
+    {
+        dbenv.close(0);
+    }
+    catch (const DbException& e)
+    {
+        printf("EnvShutdown exception: %s (%d)\n", e.what(), e.get_errno());
+    }
+    DbEnv(0).remove(GetDataDir().c_str(), 0);
+}
+
 class CDBInit
 {
 public:
@@ -35,11 +54,7 @@ public:
     }
     ~CDBInit()
     {
-        if (fDbEnvInit)
-        {
-            dbenv.close(0);
-            fDbEnvInit = false;
-        }
+        EnvShutdown();
     }
 }
 instance_of_cdbinit;
@@ -143,7 +158,7 @@ void CDB::Close()
         nMinutes = 2;
     if (strFile == "blkindex.dat" && IsInitialBlockDownload() && nBestHeight % 500 != 0)
         nMinutes = 1;
-    dbenv.txn_checkpoint(0, nMinutes, 0);
+    if (nMinutes) dbenv.txn_checkpoint(0, nMinutes, 0);
 
     CRITICAL_BLOCK(cs_db)
         --mapFileUseCount[strFile];
@@ -163,6 +178,101 @@ void static CloseDb(const string& strFile)
         }
     }
 }
+
+bool CDB::Rewrite(const string& strFile, const char* pszSkip)
+{
+    while (!fShutdown)
+    {
+        CRITICAL_BLOCK(cs_db)
+        {
+            if (!mapFileUseCount.count(strFile) || mapFileUseCount[strFile] == 0)
+            {
+                // Flush log data to the dat file
+                CloseDb(strFile);
+                dbenv.txn_checkpoint(0, 0, 0);
+                dbenv.lsn_reset(strFile.c_str(), 0);
+                mapFileUseCount.erase(strFile);
+
+                bool fSuccess = true;
+                printf("Rewriting %s...\n", strFile.c_str());
+                string strFileRes = strFile + ".rewrite";
+                { // surround usage of db with extra {}
+                    CDB db(strFile.c_str(), "r");
+                    Db* pdbCopy = new Db(&dbenv, 0);
+    
+                    int ret = pdbCopy->open(NULL,                 // Txn pointer
+                                            strFileRes.c_str(),   // Filename
+                                            "main",    // Logical db name
+                                            DB_BTREE,  // Database type
+                                            DB_CREATE,    // Flags
+                                            0);
+                    if (ret > 0)
+                    {
+                        printf("Cannot create database file %s\n", strFileRes.c_str());
+                        fSuccess = false;
+                    }
+    
+                    Dbc* pcursor = db.GetCursor();
+                    if (pcursor)
+                        while (fSuccess)
+                        {
+                            CDataStream ssKey;
+                            CDataStream ssValue;
+                            int ret = db.ReadAtCursor(pcursor, ssKey, ssValue, DB_NEXT);
+                            if (ret == DB_NOTFOUND)
+                            {
+                                pcursor->close();
+                                break;
+                            }
+                            else if (ret != 0)
+                            {
+                                pcursor->close();
+                                fSuccess = false;
+                                break;
+                            }
+                            if (pszSkip &&
+                                strncmp(&ssKey[0], pszSkip, std::min(ssKey.size(), strlen(pszSkip))) == 0)
+                                continue;
+                            if (strncmp(&ssKey[0], "\x07version", 8) == 0)
+                            {
+                                // Update version:
+                                ssValue.clear();
+                                ssValue << VERSION;
+                            }
+                            Dbt datKey(&ssKey[0], ssKey.size());
+                            Dbt datValue(&ssValue[0], ssValue.size());
+                            int ret2 = pdbCopy->put(NULL, &datKey, &datValue, DB_NOOVERWRITE);
+                            if (ret2 > 0)
+                                fSuccess = false;
+                        }
+                    if (fSuccess)
+                    {
+                        db.Close();
+                        CloseDb(strFile);
+                        if (pdbCopy->close(0))
+                            fSuccess = false;
+                        delete pdbCopy;
+                    }
+                }
+                if (fSuccess)
+                {
+                    Db dbA(&dbenv, 0);
+                    if (dbA.remove(strFile.c_str(), NULL, 0))
+                        fSuccess = false;
+                    Db dbB(&dbenv, 0);
+                    if (dbB.rename(strFileRes.c_str(), NULL, strFile.c_str(), 0))
+                        fSuccess = false;
+                }
+                if (!fSuccess)
+                    printf("Rewriting of %s FAILED!\n", strFileRes.c_str());
+                return fSuccess;
+            }
+        }
+        Sleep(100);
+    }
+    return false;
+}
+
 
 void DBFlush(bool fShutdown)
 {
@@ -195,9 +305,10 @@ void DBFlush(bool fShutdown)
         {
             char** listp;
             if (mapFileUseCount.empty())
+            {
                 dbenv.log_archive(&listp, DB_ARCH_REMOVE);
-            dbenv.close(0);
-            fDbEnvInit = false;
+                EnvShutdown();
+            }
         }
     }
 }
@@ -421,6 +532,7 @@ bool CTxDB::LoadBlockIndex()
             pindexNew->nTime          = diskindex.nTime;
             pindexNew->nBits          = diskindex.nBits;
             pindexNew->nNonce         = diskindex.nNonce;
+            pindexNew->auxpow         = diskindex.auxpow;
 
             // Watch for genesis block
             if (pindexGenesisBlock == NULL && diskindex.GetBlockHash() == hashGenesisBlock)
@@ -477,7 +589,7 @@ bool CTxDB::LoadBlockIndex()
         CBlock block;
         if (!block.ReadFromDisk(pindex))
             return error("LoadBlockIndex() : block.ReadFromDisk failed");
-        if (!block.CheckBlock())
+        if (!block.CheckBlock(pindex->nHeight))
         {
             printf("LoadBlockIndex() : *** found bad block at %d, hash=%s\n", pindex->nHeight, pindex->GetBlockHash().ToString().c_str());
             pindexFork = pindex->pprev;
@@ -519,24 +631,6 @@ bool CAddrDB::LoadAddresses()
 {
     CRITICAL_BLOCK(cs_mapAddresses)
     {
-        // Load user provided addresses
-        CAutoFile filein = fopen((GetDataDir() + "/addr.txt").c_str(), "rt");
-        if (filein)
-        {
-            try
-            {
-                char psz[1000];
-                while (fgets(psz, sizeof(psz), filein))
-                {
-                    CAddress addr(psz, NODE_NETWORK);
-                    addr.nTime = 0; // so it won't relay unless successfully connected
-                    if (addr.IsValid())
-                        AddAddress(addr);
-                }
-            }
-            catch (...) { }
-        }
-
         // Get cursor
         Dbc* pcursor = GetCursor();
         if (!pcursor)
@@ -610,7 +704,7 @@ bool CWalletDB::WriteAccount(const string& strAccount, const CAccount& account)
 
 bool CWalletDB::WriteAccountingEntry(const CAccountingEntry& acentry)
 {
-    return Write(make_tuple(string("acentry"), acentry.strAccount, ++nAccountingEntryNumber), acentry);
+    return Write(boost::make_tuple(string("acentry"), acentry.strAccount, ++nAccountingEntryNumber), acentry);
 }
 
 int64 CWalletDB::GetAccountCreditDebit(const string& strAccount)
@@ -627,8 +721,6 @@ int64 CWalletDB::GetAccountCreditDebit(const string& strAccount)
 
 void CWalletDB::ListAccountCreditDebit(const string& strAccount, list<CAccountingEntry>& entries)
 {
-    int64 nCreditDebit = 0;
-
     bool fAllAccounts = (strAccount == "*");
 
     Dbc* pcursor = GetCursor();
@@ -640,7 +732,7 @@ void CWalletDB::ListAccountCreditDebit(const string& strAccount, list<CAccountin
         // Read next record
         CDataStream ssKey;
         if (fFlags == DB_SET_RANGE)
-            ssKey << make_tuple(string("acentry"), (fAllAccounts? string("") : strAccount), uint64(0));
+            ssKey << boost::make_tuple(string("acentry"), (fAllAccounts? string("") : strAccount), uint64(0));
         CDataStream ssValue;
         int ret = ReadAtCursor(pcursor, ssKey, ssValue, fFlags);
         fFlags = DB_NEXT;
@@ -670,11 +762,12 @@ void CWalletDB::ListAccountCreditDebit(const string& strAccount, list<CAccountin
 }
 
 
-bool CWalletDB::LoadWallet(CWallet* pwallet)
+int CWalletDB::LoadWallet(CWallet* pwallet)
 {
     pwallet->vchDefaultKey.clear();
     int nFileVersion = 0;
     vector<uint256> vWalletUpgrade;
+    bool fIsEncrypted = false;
 
     // Modify defaults
 #ifndef __WXMSW__
@@ -684,13 +777,12 @@ bool CWalletDB::LoadWallet(CWallet* pwallet)
 #endif
 
     //// todo: shouldn't we catch exceptions and try to recover and continue?
-    CRITICAL_BLOCK(pwallet->cs_mapWallet)
-    CRITICAL_BLOCK(pwallet->cs_mapKeys)
+    CRITICAL_BLOCK(pwallet->cs_wallet)
     {
         // Get cursor
         Dbc* pcursor = GetCursor();
         if (!pcursor)
-            return false;
+            return DB_CORRUPT;
 
         loop
         {
@@ -701,7 +793,7 @@ bool CWalletDB::LoadWallet(CWallet* pwallet)
             if (ret == DB_NOTFOUND)
                 break;
             else if (ret != 0)
-                return false;
+                return DB_CORRUPT;
 
             // Unserialize
             // Taking advantage of the fact that pair serialization
@@ -765,14 +857,43 @@ bool CWalletDB::LoadWallet(CWallet* pwallet)
             {
                 vector<unsigned char> vchPubKey;
                 ssKey >> vchPubKey;
-                CWalletKey wkey;
+                CKey key;
                 if (strType == "key")
-                    ssValue >> wkey.vchPrivKey;
+                {
+                    CPrivKey pkey;
+                    ssValue >> pkey;
+                    key.SetPrivKey(pkey);
+                }
                 else
+                {
+                    CWalletKey wkey;
                     ssValue >> wkey;
-
-                pwallet->mapKeys[vchPubKey] = wkey.vchPrivKey;
-                mapPubKeys[Hash160(vchPubKey)] = vchPubKey;
+                    key.SetPrivKey(wkey.vchPrivKey);
+                }
+                if (!pwallet->LoadKey(key))
+                    return DB_CORRUPT;
+            }
+            else if (strType == "mkey")
+            {
+                unsigned int nID;
+                ssKey >> nID;
+                CMasterKey kMasterKey;
+                ssValue >> kMasterKey;
+                if(pwallet->mapMasterKeys.count(nID) != 0)
+                    return DB_CORRUPT;
+                pwallet->mapMasterKeys[nID] = kMasterKey;
+                if (pwallet->nMasterKeyMaxID < nID)
+                    pwallet->nMasterKeyMaxID = nID;
+            }
+            else if (strType == "ckey")
+            {
+                vector<unsigned char> vchPubKey;
+                ssKey >> vchPubKey;
+                vector<unsigned char> vchPrivKey;
+                ssValue >> vchPrivKey;
+                if (!pwallet->LoadCryptedKey(vchPubKey, vchPrivKey))
+                    return DB_CORRUPT;
+                fIsEncrypted = true;
             }
             else if (strType == "defaultkey")
             {
@@ -800,7 +921,6 @@ bool CWalletDB::LoadWallet(CWallet* pwallet)
                 if (strKey == "fGenerateBitcoins")  ssValue >> fGenerateBitcoins;
 #endif
                 if (strKey == "nTransactionFee")    ssValue >> nTransactionFee;
-                if (strKey == "addrIncoming")       ssValue >> addrIncoming;
                 if (strKey == "fLimitProcessors")   ssValue >> fLimitProcessors;
                 if (strKey == "nLimitProcessors")   ssValue >> nLimitProcessors;
                 if (strKey == "fMinimizeToTray")    ssValue >> fMinimizeToTray;
@@ -808,6 +928,13 @@ bool CWalletDB::LoadWallet(CWallet* pwallet)
                 if (strKey == "fUseProxy")          ssValue >> fUseProxy;
                 if (strKey == "addrProxy")          ssValue >> addrProxy;
                 if (fHaveUPnP && strKey == "fUseUPnP")           ssValue >> fUseUPnP;
+            }
+            else if (strType == "minversion")
+            {
+                int nMinVersion = 0;
+                ssValue >> nMinVersion;
+                if (nMinVersion > VERSION)
+                    return DB_TOO_NEW;
             }
         }
         pcursor->close();
@@ -819,7 +946,6 @@ bool CWalletDB::LoadWallet(CWallet* pwallet)
     printf("nFileVersion = %d\n", nFileVersion);
     printf("fGenerateBitcoins = %d\n", fGenerateBitcoins);
     printf("nTransactionFee = %"PRI64d"\n", nTransactionFee);
-    printf("addrIncoming = %s\n", addrIncoming.ToString().c_str());
     printf("fMinimizeToTray = %d\n", fMinimizeToTray);
     printf("fMinimizeOnClose = %d\n", fMinimizeOnClose);
     printf("fUseProxy = %d\n", fUseProxy);
@@ -828,8 +954,11 @@ bool CWalletDB::LoadWallet(CWallet* pwallet)
         printf("fUseUPnP = %d\n", fUseUPnP);
 
 
-    // Upgrade
-    if (nFileVersion < VERSION)
+    // Rewrite encrypted wallets of versions 0.4.0 and 0.5.0rc:
+    if (fIsEncrypted && (nFileVersion == 40000 || nFileVersion == 50000))
+        return DB_NEED_REWRITE;
+
+    if (nFileVersion < VERSION) // Update
     {
         // Get rid of old debug.log file in current directory
         if (nFileVersion <= 105 && !pszSetDataDir[0])
@@ -838,8 +967,7 @@ bool CWalletDB::LoadWallet(CWallet* pwallet)
         WriteVersion(VERSION);
     }
 
-
-    return true;
+    return DB_LOAD_OK;
 }
 
 void ThreadFlushWalletDB(void* parg)

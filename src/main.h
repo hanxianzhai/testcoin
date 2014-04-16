@@ -1,4 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
+// Copyright (c) 2011 The Bitcoin developers
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
 #ifndef BITCOIN_MAIN_H
@@ -11,6 +12,7 @@
 #include "db.h"
 
 #include <list>
+#include <boost/shared_ptr.hpp>
 
 class CBlock;
 class CBlockIndex;
@@ -20,23 +22,26 @@ class CKeyItem;
 class CReserveKey;
 class CWalletDB;
 
-class CMessageHeader;
 class CAddress;
 class CInv;
 class CRequestTracker;
 class CNode;
-class CBlockIndex;
+class CAuxPow;
 
 static const unsigned int MAX_BLOCK_SIZE = 1000000;
 static const unsigned int MAX_BLOCK_SIZE_GEN = MAX_BLOCK_SIZE/2;
 static const int MAX_BLOCK_SIGOPS = MAX_BLOCK_SIZE/50;
 static const int64 COIN = 100000000;
 static const int64 CENT = 1000000;
-static const int64 MIN_TX_FEE = 50000;
-static const int64 MIN_RELAY_TX_FEE = 10000;
-static const int64 MAX_MONEY = 21000000 * COIN;
+
+
+static const int64 MIN_TX_FEE = 500000000;
+static const int64 MIN_RELAY_TX_FEE = MIN_TX_FEE;
+static const int64 MAX_MONEY = (int64)21000000 * (int64)1000 * COIN;
 inline bool MoneyRange(int64 nValue) { return (nValue >= 0 && nValue <= MAX_MONEY); }
 static const int COINBASE_MATURITY = 100;
+// Threshold for nLockTime: below this value it is interpreted as block number, otherwise as UNIX timestamp.
+static const int LOCKTIME_THRESHOLD = 500000000; // Tue Nov  5 00:53:20 1985 UTC
 #ifdef USE_UPNP
 static const int fHaveUPnP = true;
 #else
@@ -44,14 +49,9 @@ static const int fHaveUPnP = false;
 #endif
 
 
-
-
-
-
 extern CCriticalSection cs_main;
 extern std::map<uint256, CBlockIndex*> mapBlockIndex;
 extern uint256 hashGenesisBlock;
-extern CBigNum bnProofOfWorkLimit;
 extern CBlockIndex* pindexGenesisBlock;
 extern int nBestHeight;
 extern CBigNum bnBestChainWork;
@@ -68,7 +68,6 @@ extern std::set<CWallet*> setpwalletRegistered;
 // Settings
 extern int fGenerateBitcoins;
 extern int64 nTransactionFee;
-extern CAddress addrIncoming;
 extern int fLimitProcessors;
 extern int nLimitProcessors;
 extern int fMinimizeToTray;
@@ -85,6 +84,7 @@ class CTxIndex;
 
 void RegisterWallet(CWallet* pwalletIn);
 void UnregisterWallet(CWallet* pwalletIn);
+bool ProcessBlock(CNode* pfrom, CBlock* pblock);
 bool CheckDiskSpace(uint64 nAdditionalBytes=0);
 FILE* OpenBlockFile(unsigned int nFile, unsigned int nBlockPos, const char* pszMode="rb");
 FILE* AppendBlockFile(unsigned int& nFileRet);
@@ -95,6 +95,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle);
 void GenerateBitcoins(bool fGenerate, CWallet* pwallet);
 CBlock* CreateNewBlock(CReserveKey& reservekey);
 void IncrementExtraNonce(CBlock* pblock, CBlockIndex* pindexPrev, unsigned int& nExtraNonce, int64& nPrevTime);
+void IncrementExtraNonceWithAux(CBlock* pblock, CBlockIndex* pindexPrev, unsigned int& nExtraNonce, int64& nPrevTime, std::vector<unsigned char>& vchAux);
 void FormatHashBuffers(CBlock* pblock, char* pmidstate, char* pdata, char* phash1);
 bool CheckWork(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey);
 bool CheckProofOfWork(uint256 hash, unsigned int nBits);
@@ -441,7 +442,7 @@ public:
             nBlockHeight = nBestHeight;
         if (nBlockTime == 0)
             nBlockTime = GetAdjustedTime();
-        if ((int64)nLockTime < (nLockTime < 500000000 ? (int64)nBlockHeight : nBlockTime))
+        if ((int64)nLockTime < (nLockTime < LOCKTIME_THRESHOLD ? (int64)nBlockHeight : nBlockTime))
             return true;
         BOOST_FOREACH(const CTxIn& txin, vin)
             if (!txin.IsFinal())
@@ -549,11 +550,9 @@ public:
             }
         }
 
-        // To limit dust spam, require MIN_TX_FEE/MIN_RELAY_TX_FEE if any output is less than 0.01
-        if (nMinFee < nBaseFee)
-            BOOST_FOREACH(const CTxOut& txout, vout)
-                if (txout.nValue < CENT)
-                    nMinFee = nBaseFee;
+        // To limit dust spam, require an additional one tenth of MIN_TX_FEE/MIN_RELAY_TX_FEE for each output
+        BOOST_FOREACH(const CTxOut& txout, vout)
+             nMinFee += nBaseFee / 10;
 
         // Raise the price as the block approaches full
         if (nBlockSize != 1 && nNewBlockSize >= MAX_BLOCK_SIZE_GEN/2)
@@ -567,7 +566,6 @@ public:
             nMinFee = MAX_MONEY;
         return nMinFee;
     }
-
 
     bool ReadFromDisk(CDiskTxPos pos, FILE** pfileRet=NULL)
     {
@@ -754,9 +752,28 @@ public:
     int GetDepthInMainChain() const;
 };
 
+template <typename Stream>
+int ReadWriteAuxPow(Stream& s, const boost::shared_ptr<CAuxPow>& auxpow, int nType, int nVersion, CSerActionSerialize ser_action);
 
+template <typename Stream>
+int ReadWriteAuxPow(Stream& s, boost::shared_ptr<CAuxPow>& auxpow, int nType, int nVersion, CSerActionUnserialize ser_action);
 
+template <typename Stream>
+int ReadWriteAuxPow(Stream& s, const boost::shared_ptr<CAuxPow>& auxpow, int nType, int nVersion, CSerActionGetSerializeSize ser_action);
 
+enum
+{
+    // primary version
+    BLOCK_VERSION_DEFAULT        = (1 << 0),
+
+    // modifiers
+    BLOCK_VERSION_AUXPOW         = (1 << 8),
+
+    // bits allocated for chain ID
+    BLOCK_VERSION_CHAIN_START    = (1 << 16),
+    BLOCK_VERSION_CHAIN_END      = (1 << 30),
+};
+ 
 
 //
 // Nodes collect new transactions into a block, hash them into a hash tree,
@@ -783,6 +800,9 @@ public:
     // network and disk
     std::vector<CTransaction> vtx;
 
+    // header
+    boost::shared_ptr<CAuxPow> auxpow;
+
     // memory only
     mutable std::vector<uint256> vMerkleTree;
 
@@ -802,24 +822,23 @@ public:
         READWRITE(nBits);
         READWRITE(nNonce);
 
+        nSerSize += ReadWriteAuxPow(s, auxpow, nType, nVersion, ser_action);
+
         // ConnectBlock depends on vtx being last so it can calculate offset
-        if (!(nType & (SER_GETHASH|SER_BLOCKHEADERONLY)))
+        if (!(nType & SER_BLOCKHEADERONLY))
             READWRITE(vtx);
         else if (fRead)
             const_cast<CBlock*>(this)->vtx.clear();
     )
 
-    void SetNull()
+    int GetChainID() const
     {
-        nVersion = 1;
-        hashPrevBlock = 0;
-        hashMerkleRoot = 0;
-        nTime = 0;
-        nBits = 0;
-        nNonce = 0;
-        vtx.clear();
-        vMerkleTree.clear();
-    }
+        return nVersion / BLOCK_VERSION_CHAIN_START;
+     }
+ 
+    void SetAuxPow(CAuxPow* pow);
+
+    void SetNull();
 
     bool IsNull() const
     {
@@ -927,6 +946,8 @@ public:
         return true;
     }
 
+    bool CheckProofOfWork(int nHeight) const;
+
     bool ReadFromDisk(unsigned int nFile, unsigned int nBlockPos, bool fReadTransactions=true)
     {
         SetNull();
@@ -942,7 +963,7 @@ public:
         filein >> *this;
 
         // Check the header
-        if (!CheckProofOfWork(GetHash(), nBits))
+        if (!CheckProofOfWork(INT_MAX))
             return error("CBlock::ReadFromDisk() : errors in block header");
 
         return true;
@@ -976,7 +997,7 @@ public:
     bool ReadFromDisk(const CBlockIndex* pindex, bool fReadTransactions=true);
     bool SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew);
     bool AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos);
-    bool CheckBlock() const;
+    bool CheckBlock(int nHeight) const;
     bool AcceptBlock();
 };
 
@@ -1011,7 +1032,9 @@ public:
     unsigned int nBits;
     unsigned int nNonce;
 
-
+    // if this is an aux work block
+    boost::shared_ptr<CAuxPow> auxpow;
+ 
     CBlockIndex()
     {
         phashBlock = NULL;
@@ -1027,6 +1050,7 @@ public:
         nTime          = 0;
         nBits          = 0;
         nNonce         = 0;
+        auxpow.reset();
     }
 
     CBlockIndex(unsigned int nFileIn, unsigned int nBlockPosIn, CBlock& block)
@@ -1044,6 +1068,7 @@ public:
         nTime          = block.nTime;
         nBits          = block.nBits;
         nNonce         = block.nNonce;
+        auxpow         = block.auxpow;
     }
 
     CBlock GetBlockHeader() const
@@ -1056,6 +1081,7 @@ public:
         block.nTime          = nTime;
         block.nBits          = nBits;
         block.nNonce         = nNonce;
+        block.auxpow         = auxpow;
         return block;
     }
 
@@ -1083,10 +1109,7 @@ public:
         return (pnext || this == pindexBest);
     }
 
-    bool CheckIndex() const
-    {
-        return CheckProofOfWork(GetBlockHash(), nBits);
-    }
+    bool CheckIndex() const;
 
     bool EraseBlockFromDisk()
     {
@@ -1133,13 +1156,7 @@ public:
 
 
 
-    std::string ToString() const
-    {
-        return strprintf("CBlockIndex(nprev=%08x, pnext=%08x, nFile=%d, nBlockPos=%-6d nHeight=%d, merkle=%s, hashBlock=%s)",
-            pprev, pnext, nFile, nBlockPos, nHeight,
-            hashMerkleRoot.ToString().substr(0,10).c_str(),
-            GetBlockHash().ToString().substr(0,20).c_str());
-    }
+    std::string ToString() const;
 
     void print() const
     {
@@ -1187,6 +1204,7 @@ public:
         READWRITE(nTime);
         READWRITE(nBits);
         READWRITE(nNonce);
+        ReadWriteAuxPow(s, auxpow, nType, this->nVersion, ser_action);
     )
 
     uint256 GetBlockHash() const
@@ -1555,19 +1573,5 @@ public:
 
     bool ProcessAlert();
 };
-
-
-
-
-
-
-
-
-
-
-
-extern std::map<uint256, CTransaction> mapTransactions;
-extern std::map<uint160, std::vector<unsigned char> > mapPubKeys;
-extern CCriticalSection cs_mapPubKeys;
 
 #endif

@@ -1,4 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
+// Copyright (c) 2011 The Bitcoin developers
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
 #ifndef BITCOIN_UTIL_H
@@ -65,14 +66,6 @@ typedef unsigned long long  uint64;
 
 // This is needed because the foreach macro can't get over the comma in pair<t1, t2>
 #define PAIRTYPE(t1, t2)    pair<t1, t2>
-
-// Used to bypass the rule against non-const reference to temporary
-// where it makes sense with wrappers such as CFlatData or CTxDB
-template<typename T>
-inline T& REF(const T& val)
-{
-    return (T&)val;
-}
 
 // Align by increasing pointer, must have extra space at end of buffer
 template <size_t nBytes, typename T>
@@ -187,6 +180,10 @@ bool ParseMoney(const std::string& str, int64& nRet);
 bool ParseMoney(const char* pszIn, int64& nRet);
 std::vector<unsigned char> ParseHex(const char* psz);
 std::vector<unsigned char> ParseHex(const std::string& str);
+std::vector<unsigned char> DecodeBase64(const char* p, bool* pfInvalid = NULL);
+std::string DecodeBase64(const std::string& str);
+std::string EncodeBase64(const unsigned char* pch, size_t len);
+std::string EncodeBase64(const std::string& str);
 void ParseParameters(int argc, char* argv[]);
 const char* wxGetTranslation(const char* psz);
 bool WildcardMatch(const char* psz, const char* mask);
@@ -222,31 +219,17 @@ std::string FormatFullVersion();
 
 
 
-// Wrapper to automatically initialize critical sections
+// Wrapper to automatically initialize mutex
 class CCriticalSection
 {
-#ifdef __WXMSW__
-protected:
-    CRITICAL_SECTION cs;
-public:
-    explicit CCriticalSection() { InitializeCriticalSection(&cs); }
-    ~CCriticalSection() { DeleteCriticalSection(&cs); }
-    void Enter() { EnterCriticalSection(&cs); }
-    void Leave() { LeaveCriticalSection(&cs); }
-    bool TryEnter() { return TryEnterCriticalSection(&cs); }
-#else
 protected:
     boost::interprocess::interprocess_recursive_mutex mutex;
 public:
     explicit CCriticalSection() { }
     ~CCriticalSection() { }
-    void Enter() { mutex.lock(); }
-    void Leave() { mutex.unlock(); }
-    bool TryEnter() { return mutex.try_lock(); }
-#endif
-public:
-    const char* pszFile;
-    int nLine;
+    void Enter(const char* pszName, const char* pszFile, int nLine);
+    void Leave();
+    bool TryEnter(const char* pszName, const char* pszFile, int nLine);
 };
 
 // Automatically leave critical section when leaving block, needed for exception safety
@@ -254,32 +237,56 @@ class CCriticalBlock
 {
 protected:
     CCriticalSection* pcs;
+
 public:
-    CCriticalBlock(CCriticalSection& csIn) { pcs = &csIn; pcs->Enter(); }
-    ~CCriticalBlock() { pcs->Leave(); }
+    CCriticalBlock(CCriticalSection& csIn, const char* pszName, const char* pszFile, int nLine)
+    {
+        pcs = &csIn;
+        pcs->Enter(pszName, pszFile, nLine);
+    }
+
+    operator bool() const
+    {
+        return true;
+    }
+
+    ~CCriticalBlock()
+    {
+        pcs->Leave();
+    }
 };
 
-// WARNING: This will catch continue and break!
-// break is caught with an assertion, but there's no way to detect continue.
-// I'd rather be careful than suffer the other more error prone syntax.
-// The compiler will optimise away all this loop junk.
 #define CRITICAL_BLOCK(cs)     \
-    for (bool fcriticalblockonce=true; fcriticalblockonce; assert(("break caught by CRITICAL_BLOCK!", !fcriticalblockonce)), fcriticalblockonce=false)  \
-    for (CCriticalBlock criticalblock(cs); fcriticalblockonce && (cs.pszFile=__FILE__, cs.nLine=__LINE__, true); fcriticalblockonce=false, cs.pszFile=NULL, cs.nLine=0)
+    if (CCriticalBlock criticalblock = CCriticalBlock(cs, #cs, __FILE__, __LINE__))
 
 class CTryCriticalBlock
 {
 protected:
     CCriticalSection* pcs;
+
 public:
-    CTryCriticalBlock(CCriticalSection& csIn) { pcs = (csIn.TryEnter() ? &csIn : NULL); }
-    ~CTryCriticalBlock() { if (pcs) pcs->Leave(); }
-    bool Entered() { return pcs != NULL; }
+    CTryCriticalBlock(CCriticalSection& csIn, const char* pszName, const char* pszFile, int nLine)
+    {
+        pcs = (csIn.TryEnter(pszName, pszFile, nLine) ? &csIn : NULL);
+    }
+
+    operator bool() const
+    {
+        return Entered();
+    }
+
+    ~CTryCriticalBlock()
+    {
+        if (pcs)
+        {
+            pcs->Leave();
+        }
+    }
+    bool Entered() const { return pcs != NULL; }
 };
 
 #define TRY_CRITICAL_BLOCK(cs)     \
-    for (bool fcriticalblockonce=true; fcriticalblockonce; assert(("break caught by TRY_CRITICAL_BLOCK!", !fcriticalblockonce)), fcriticalblockonce=false)  \
-    for (CTryCriticalBlock criticalblock(cs); fcriticalblockonce && (fcriticalblockonce = criticalblock.Entered()) && (cs.pszFile=__FILE__, cs.nLine=__LINE__, true); fcriticalblockonce=false, cs.pszFile=NULL, cs.nLine=0)
+    if (CTryCriticalBlock criticalblock = CTryCriticalBlock(cs, #cs, __FILE__, __LINE__))
 
 
 
@@ -474,19 +481,6 @@ inline void heapchk()
 #endif
 }
 
-// Randomize the stack to help protect against buffer overrun exploits
-#define IMPLEMENT_RANDOMIZE_STACK(ThreadFn)     \
-    {                                           \
-        static char nLoops;                     \
-        if (nLoops <= 0)                        \
-            nLoops = GetRand(20) + 1;           \
-        if (nLoops-- > 1)                       \
-        {                                       \
-            ThreadFn;                           \
-            return;                             \
-        }                                       \
-    }
-
 #define CATCH_PRINT_EXCEPTION(pszFn)     \
     catch (std::exception& e) {          \
         PrintException(&e, (pszFn));     \
@@ -623,7 +617,10 @@ inline pthread_t CreateThread(void(*pfn)(void*), void* parg, bool fWantHandle=fa
         return (pthread_t)0;
     }
     if (!fWantHandle)
+    {
+        pthread_detach(hthread);
         return (pthread_t)-1;
+    }
     return hthread;
 }
 
@@ -648,7 +645,7 @@ inline bool TerminateThread(pthread_t hthread, unsigned int nExitCode)
     return (pthread_cancel(hthread) == 0);
 }
 
-inline void ExitThread(unsigned int nExitCode)
+inline void ExitThread(size_t nExitCode)
 {
     pthread_exit((void*)nExitCode);
 }
@@ -662,8 +659,8 @@ inline bool AffinityBugWorkaround(void(*pfn)(void*))
 {
 #ifdef __WXMSW__
     // Sometimes after a few hours affinity gets stuck on one processor
-    DWORD dwProcessAffinityMask = -1;
-    DWORD dwSystemAffinityMask = -1;
+    DWORD_PTR dwProcessAffinityMask = -1;
+    DWORD_PTR dwSystemAffinityMask = -1;
     GetProcessAffinityMask(GetCurrentProcess(), &dwProcessAffinityMask, &dwSystemAffinityMask);
     DWORD dwPrev1 = SetThreadAffinityMask(GetCurrentThread(), dwProcessAffinityMask);
     DWORD dwPrev2 = SetThreadAffinityMask(GetCurrentThread(), dwProcessAffinityMask);
@@ -676,6 +673,12 @@ inline bool AffinityBugWorkaround(void(*pfn)(void*))
     }
 #endif
     return false;
+}
+
+inline uint32_t ByteReverse(uint32_t value)
+{
+	value = ((value & 0xFF00FF00) >> 8) | ((value & 0x00FF00FF) << 8);
+	return (value<<16) | (value>>16);
 }
 
 #endif

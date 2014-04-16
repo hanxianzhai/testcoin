@@ -1,4 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
+// Copyright (c) 2011 The Bitcoin developers
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
 #include "headers.h"
@@ -388,7 +389,7 @@ bool ParseMoney(const char* pszIn, int64& nRet)
     for (; *p; p++)
         if (!isspace(*p))
             return false;
-    if (strWhole.size() > 14)
+    if (strWhole.size() > 10) // guard against 63 bit overflow
         return false;
     if (nUnits < 0 || nUnits > COIN)
         return false;
@@ -444,7 +445,6 @@ vector<unsigned char> ParseHex(const string& str)
     return ParseHex(str.c_str());
 }
 
-
 void ParseParameters(int argc, char* argv[])
 {
     mapArgs.clear();
@@ -471,6 +471,145 @@ void ParseParameters(int argc, char* argv[])
     }
 }
 
+string EncodeBase64(const unsigned char* pch, size_t len)
+{
+    static const char *pbase64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    string strRet="";
+    strRet.reserve((len+2)/3*4);
+
+    int mode=0, left=0;
+    const unsigned char *pchEnd = pch+len;
+
+    while (pch<pchEnd)
+    {
+        int enc = *(pch++);
+        switch (mode)
+        {
+            case 0: // we have no bits
+                strRet += pbase64[enc >> 2];
+                left = (enc & 3) << 4;
+                mode = 1;
+                break;
+
+            case 1: // we have two bits
+                strRet += pbase64[left | (enc >> 4)];
+                left = (enc & 15) << 2;
+                mode = 2;
+                break;
+
+            case 2: // we have four bits
+                strRet += pbase64[left | (enc >> 6)];
+                strRet += pbase64[enc & 63];
+                mode = 0;
+                break;
+        }
+    }
+
+    if (mode)
+    {
+        strRet += pbase64[left];
+        strRet += '=';
+        if (mode == 1)
+            strRet += '=';
+    }
+
+    return strRet;
+}
+
+string EncodeBase64(const string& str)
+{
+    return EncodeBase64((const unsigned char*)str.c_str(), str.size());
+}
+
+vector<unsigned char> DecodeBase64(const char* p, bool* pfInvalid)
+{
+    static const int decode64_table[256] =
+    {
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, 62, -1, -1, -1, 63, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1,
+        -1, -1, -1, -1, -1,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14,
+        15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, -1, -1, -1, -1, -1, -1, 26, 27, 28,
+        29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
+        49, 50, 51, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1
+    };
+
+    if (pfInvalid)
+        *pfInvalid = false;
+
+    vector<unsigned char> vchRet;
+    vchRet.reserve(strlen(p)*3/4);
+
+    int mode = 0;
+    int left = 0;
+
+    while (1)
+    {
+         int dec = decode64_table[*p];
+         if (dec == -1) break;
+         p++;
+         switch (mode)
+         {
+             case 0: // we have no bits and get 6
+                 left = dec;
+                 mode = 1;
+                 break;
+
+              case 1: // we have 6 bits and keep 4
+                  vchRet.push_back((left<<2) | (dec>>4));
+                  left = dec & 15;
+                  mode = 2;
+                  break;
+
+             case 2: // we have 4 bits and get 6, we keep 2
+                 vchRet.push_back((left<<4) | (dec>>2));
+                 left = dec & 3;
+                 mode = 3;
+                 break;
+
+             case 3: // we have 2 bits and get 6
+                 vchRet.push_back((left<<6) | dec);
+                 mode = 0;
+                 break;
+         }
+    }
+
+    if (pfInvalid)
+        switch (mode)
+        {
+            case 0: // 4n base64 characters processed: ok
+                break;
+
+            case 1: // 4n+1 base64 character processed: impossible
+                *pfInvalid = true;
+                break;
+
+            case 2: // 4n+2 base64 characters processed: require '=='
+                if (left || p[0] != '=' || p[1] != '=' || decode64_table[p[2]] != -1)
+                    *pfInvalid = true;
+                break;
+
+            case 3: // 4n+3 base64 characters processed: require '='
+                if (left || p[0] != '=' || decode64_table[p[1]] != -1)
+                    *pfInvalid = true;
+                break;
+        }
+
+    return vchRet;
+}
+
+string DecodeBase64(const string& str)
+{
+    vector<unsigned char> vchRet = DecodeBase64(str.c_str());
+    return string((const char*)&vchRet[0], vchRet.size());
+}
 
 const char* wxGetTranslation(const char* pszEnglish)
 {
@@ -550,7 +689,7 @@ void FormatException(char* pszMessage, std::exception* pex, const char* pszThrea
     pszModule[0] = '\0';
     GetModuleFileNameA(NULL, pszModule, sizeof(pszModule));
 #else
-    const char* pszModule = "bitcoin";
+    const char* pszModule = "devcoin";
 #endif
     if (pex)
         snprintf(pszMessage, 1000,
@@ -576,7 +715,7 @@ void PrintException(std::exception* pex, const char* pszThread)
     strMiscWarning = pszMessage;
 #ifdef GUI
     if (wxTheApp && !fDaemon)
-        MyMessageBox(pszMessage, "Bitcoin", wxOK | wxICON_ERROR);
+        MyMessageBox(pszMessage, "Devcoin", wxOK | wxICON_ERROR);
 #endif
     throw;
 }
@@ -588,7 +727,7 @@ void ThreadOneMessageBox(string strMessage)
     if (fMessageBoxOpen)
         return;
     fMessageBoxOpen = true;
-    ThreadSafeMessageBox(strMessage, "Bitcoin", wxOK | wxICON_EXCLAMATION);
+    ThreadSafeMessageBox(strMessage, "Devcoin", wxOK | wxICON_EXCLAMATION);
     fMessageBoxOpen = false;
 }
 
@@ -650,12 +789,12 @@ string MyGetSpecialFolderPath(int nFolder, bool fCreate)
 
 string GetDefaultDataDir()
 {
-    // Windows: C:\Documents and Settings\username\Application Data\Bitcoin
-    // Mac: ~/Library/Application Support/Bitcoin
-    // Unix: ~/.bitcoin
+    // Windows: C:\Documents and Settings\username\Application Data\Devcoin
+    // Mac: ~/Library/Application Support/Devcoin
+    // Unix: ~/.devcoin
 #ifdef __WXMSW__
     // Windows
-    return MyGetSpecialFolderPath(CSIDL_APPDATA, true) + "\\Bitcoin";
+    return MyGetSpecialFolderPath(CSIDL_APPDATA, true) + "\\Devcoin";
 #else
     char* pszHome = getenv("HOME");
     if (pszHome == NULL || strlen(pszHome) == 0)
@@ -667,10 +806,10 @@ string GetDefaultDataDir()
     // Mac
     strHome += "Library/Application Support/";
     filesystem::create_directory(strHome.c_str());
-    return strHome + "Bitcoin";
+    return strHome + "Devcoin";
 #else
     // Unix
-    return strHome + ".bitcoin";
+    return strHome + ".devcoin";
 #endif
 #endif
 }
@@ -720,7 +859,7 @@ string GetDataDir()
 string GetConfigFile()
 {
     namespace fs = boost::filesystem;
-    fs::path pathConfig(GetArg("-conf", "bitcoin.conf"));
+    fs::path pathConfig(GetArg("-conf", "devcoin.conf"));
     if (!pathConfig.is_complete())
         pathConfig = fs::path(GetDataDir()) / pathConfig;
     return pathConfig.string();
@@ -741,7 +880,7 @@ void ReadConfigFile(map<string, string>& mapSettingsRet,
     
     for (pod::config_file_iterator it(streamConfig, setOptions), end; it != end; ++it)
     {
-        // Don't overwrite existing settings so command line settings override bitcoin.conf
+        // Don't overwrite existing settings so command line settings override devcoin.conf
         string strKey = string("-") + it->string_key;
         if (mapSettingsRet.count(strKey) == 0)
             mapSettingsRet[strKey] = it->value[0];
@@ -752,7 +891,7 @@ void ReadConfigFile(map<string, string>& mapSettingsRet,
 string GetPidFile()
 {
     namespace fs = boost::filesystem;
-    fs::path pathConfig(GetArg("-pid", "bitcoind.pid"));
+    fs::path pathConfig(GetArg("-pid", "devcoind.pid"));
     if (!pathConfig.is_complete())
         pathConfig = fs::path(GetDataDir()) / pathConfig;
     return pathConfig.string();
@@ -760,8 +899,8 @@ string GetPidFile()
 
 void CreatePidFile(string pidFile, pid_t pid)
 {
-    FILE* file;
-    if (file = fopen(pidFile.c_str(), "w"))
+    FILE* file = fopen(pidFile.c_str(), "w");
+    if (file)
     {
         fprintf(file, "%d\n", pid);
         fclose(file);
@@ -790,7 +929,9 @@ void ShrinkDebugFile()
         fseek(file, -sizeof(pch), SEEK_END);
         int nBytes = fread(pch, 1, sizeof(pch), file);
         fclose(file);
-        if (file = fopen(strFile.c_str(), "w"))
+
+        file = fopen(strFile.c_str(), "w");
+        if (file)
         {
             fwrite(pch, 1, nBytes, file);
             fclose(file);
@@ -864,10 +1005,10 @@ void AddTimeData(unsigned int ip, int64 nTime)
                 if (!fMatch)
                 {
                     fDone = true;
-                    string strMessage = _("Warning: Please check that your computer's date and time are correct.  If your clock is wrong Bitcoin will not work properly.");
+                    string strMessage = _("Warning: Please check that your computer's date and time are correct.  If your clock is wrong Devcoin will not work properly.");
                     strMiscWarning = strMessage;
                     printf("*** %s\n", strMessage.c_str());
-                    boost::thread(boost::bind(ThreadSafeMessageBox, strMessage+" ", string("Bitcoin"), wxOK | wxICON_EXCLAMATION, (wxWindow*)NULL, -1, -1));
+                    boost::thread(boost::bind(ThreadSafeMessageBox, strMessage+" ", string("Devcoin"), wxOK | wxICON_EXCLAMATION, (wxWindow*)NULL, -1, -1));
                 }
             }
         }
@@ -905,5 +1046,140 @@ string FormatFullVersion()
 
 
 
+#ifdef DEBUG_LOCKORDER
+//
+// Early deadlock detection.
+// Problem being solved:
+//    Thread 1 locks  A, then B, then C
+//    Thread 2 locks  D, then C, then A
+//     --> may result in deadlock between the two threads, depending on when they run.
+// Solution implemented here:
+// Keep track of pairs of locks: (A before B), (A before C), etc.
+// Complain if any thread trys to lock in a different order.
+//
+
+struct CLockLocation
+{
+    CLockLocation(const char* pszName, const char* pszFile, int nLine)
+    {
+        mutexName = pszName;
+        sourceFile = pszFile;
+        sourceLine = nLine;
+    }
+
+    std::string ToString() const
+    {
+        return mutexName+"  "+sourceFile+":"+itostr(sourceLine);
+    }
+
+private:
+    std::string mutexName;
+    std::string sourceFile;
+    int sourceLine;
+};
+
+typedef std::vector< std::pair<CCriticalSection*, CLockLocation> > LockStack;
+
+static boost::interprocess::interprocess_mutex dd_mutex;
+static std::map<std::pair<CCriticalSection*, CCriticalSection*>, LockStack> lockorders;
+static boost::thread_specific_ptr<LockStack> lockstack;
 
 
+static void potential_deadlock_detected(const std::pair<CCriticalSection*, CCriticalSection*>& mismatch, const LockStack& s1, const LockStack& s2)
+{
+    printf("POTENTIAL DEADLOCK DETECTED\n");
+    printf("Previous lock order was:\n");
+    BOOST_FOREACH(const PAIRTYPE(CCriticalSection*, CLockLocation)& i, s2)
+    {
+        if (i.first == mismatch.first) printf(" (1)");
+        if (i.first == mismatch.second) printf(" (2)");
+        printf(" %s\n", i.second.ToString().c_str());
+    }
+    printf("Current lock order is:\n");
+    BOOST_FOREACH(const PAIRTYPE(CCriticalSection*, CLockLocation)& i, s1)
+    {
+        if (i.first == mismatch.first) printf(" (1)");
+        if (i.first == mismatch.second) printf(" (2)");
+        printf(" %s\n", i.second.ToString().c_str());
+    }
+}
+
+static void push_lock(CCriticalSection* c, const CLockLocation& locklocation)
+{
+    bool fOrderOK = true;
+    if (lockstack.get() == NULL)
+        lockstack.reset(new LockStack);
+
+    if (fDebug) printf("Locking: %s\n", locklocation.ToString().c_str());
+    dd_mutex.lock();
+
+    (*lockstack).push_back(std::make_pair(c, locklocation));
+
+    BOOST_FOREACH(const PAIRTYPE(CCriticalSection*, CLockLocation)& i, (*lockstack))
+    {
+        if (i.first == c) break;
+
+        std::pair<CCriticalSection*, CCriticalSection*> p1 = std::make_pair(i.first, c);
+        if (lockorders.count(p1))
+            continue;
+        lockorders[p1] = (*lockstack);
+
+        std::pair<CCriticalSection*, CCriticalSection*> p2 = std::make_pair(c, i.first);
+        if (lockorders.count(p2))
+        {
+            potential_deadlock_detected(p1, lockorders[p2], lockorders[p1]);
+            break;
+        }
+    }
+    dd_mutex.unlock();
+}
+
+static void pop_lock()
+{
+    if (fDebug) 
+    {
+        const CLockLocation& locklocation = (*lockstack).rbegin()->second;
+        printf("Unlocked: %s\n", locklocation.ToString().c_str());
+    }
+    dd_mutex.lock();
+    (*lockstack).pop_back();
+    dd_mutex.unlock();
+}
+
+void CCriticalSection::Enter(const char* pszName, const char* pszFile, int nLine)
+{
+    push_lock(this, CLockLocation(pszName, pszFile, nLine));
+    mutex.lock();
+}
+void CCriticalSection::Leave()
+{
+    mutex.unlock();
+    pop_lock();
+}
+bool CCriticalSection::TryEnter(const char* pszName, const char* pszFile, int nLine)
+{
+    push_lock(this, CLockLocation(pszName, pszFile, nLine));
+    bool result = mutex.try_lock();
+    if (!result) pop_lock();
+    return result;
+}
+
+#else
+
+void CCriticalSection::Enter(const char*, const char*, int)
+{
+    mutex.lock();
+}
+
+void CCriticalSection::Leave()
+{
+    mutex.unlock();
+}
+
+bool CCriticalSection::TryEnter(const char*, const char*, int)
+{
+    bool result = mutex.try_lock();
+    return result;
+}
+
+#endif /* DEBUG_LOCKORDER */
